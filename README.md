@@ -634,6 +634,6 @@ docker compose up -d
 
 ## Team Members
 
-- [Member 1 Name] - [Role: Project Lead / System Architect / Security Analyst]
-- [Member 2 Name] - [Role]
-- [Member 3 Name] - [Role]
+- Emily Hernandez - Project Lead
+- Jediah Mayberry - System Architect
+- Jeraldhin Leon - Security Analyst
