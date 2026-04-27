@@ -1,0 +1,289 @@
+# =============================================================================
+# CIS 3353 - Secure Coffee Shop Security Lab
+# Docker Compose Orchestration
+# =============================================================================
+#
+# Architecture:
+#   - Firewall Gateway (Alpine + iptables) .... 10.10.0.1
+#   - Wazuh Manager (SIEM engine) ............ 10.10.0.10
+#   - Wazuh Dashboard (Web UI) ............... 10.10.0.11
+#   - Wazuh Indexer (OpenSearch) .............. 10.10.0.12
+#   - Jokopi Coffee App (target) ............. 10.10.0.20
+#   - Kali Linux (attacker) .................. 10.10.0.100
+#
+# Usage:
+#   1. Generate SSL certs:  ./scripts/setup/generate-certs.sh
+#   2. Build all images:    docker compose build
+#   3. Start the lab:       docker compose up -d
+#   4. Check status:        docker compose ps
+#   5. Stop the lab:        docker compose down
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # FIREWALL GATEWAY (pfSense-equivalent)
+  # ===========================================================================
+  # Alpine-based firewall with iptables, logging, rate limiting, and a web
+  # management UI. Acts as the network gateway for all containers.
+  # NOTE: pfSense CE does not have an official Docker image. This container
+  # replicates pfSense functionality (stateful firewall, NAT, logging,
+  # web management) in a Docker-compatible format. For presentations,
+  # refer to this as "pfSense-style firewall gateway."
+  # ===========================================================================
+  firewall:
+    build:
+      context: ./docker/firewall
+      dockerfile: Dockerfile
+    container_name: pfsense-firewall
+    hostname: pfsense
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${FIREWALL_IP}
+    ports:
+      - "8443:8443"     # Firewall Web Management UI
+      - "8080:80"       # Forward to Jokopi app (external access)
+      - "5601:5601"     # Forward to Wazuh Dashboard (management)
+    volumes:
+      - firewall-logs:/var/log/firewall
+      - ./configs/firewall:/etc/firewall/rules.d
+      - ./scripts/active-response:/opt/active-response
+    environment:
+      - ADMIN_USER=${FIREWALL_ADMIN_USER}
+      - ADMIN_PASS=${FIREWALL_ADMIN_PASS}
+      - LAN_SUBNET=${NETWORK_SUBNET}
+      - JOKOPI_IP=${JOKOPI_APP_IP}
+      - WAZUH_DASHBOARD_IP=${WAZUH_DASHBOARD_IP}
+      - WAZUH_MANAGER_IP=${WAZUH_MANAGER_IP}
+    healthcheck:
+      test: ["CMD", "iptables", "-L", "-n"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # WAZUH INDEXER (OpenSearch)
+  # ===========================================================================
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.9.2
+    container_name: wazuh-indexer
+    hostname: ${WAZUH_INDEXER_HOSTNAME}
+    restart: unless-stopped
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${WAZUH_INDEXER_IP}
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "bootstrap.memory_lock=true"
+      - "discovery.type=single-node"
+      - "plugins.security.ssl.http.enabled=false"
+      - "compatibility.override_main_response_version=true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - ./configs/ssl/indexer.pem:/usr/share/wazuh-indexer/certs/indexer.pem:ro
+      - ./configs/ssl/indexer-key.pem:/usr/share/wazuh-indexer/certs/indexer-key.pem:ro
+      - ./configs/ssl/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 | grep -q 'wazuh-indexer'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # WAZUH MANAGER (SIEM Engine)
+  # ===========================================================================
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.9.2
+    container_name: wazuh-manager
+    hostname: ${WAZUH_MANAGER_HOSTNAME}
+    restart: unless-stopped
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${WAZUH_MANAGER_IP}
+    ports:
+      - "1514:1514"     # Agent communication (TCP)
+      - "1515:1515"     # Agent registration
+      - "55000:55000"   # Wazuh API
+    environment:
+      - INDEXER_URL=https://${WAZUH_INDEXER_IP}:9200
+      - INDEXER_USERNAME=${INDEXER_USERNAME}
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD}
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat-key.pem
+      - API_USERNAME=${WAZUH_API_USER}
+      - API_PASSWORD=${WAZUH_API_PASSWORD}
+    volumes:
+      - wazuh-manager-config:/var/ossec/etc
+      - wazuh-manager-api:/var/ossec/api/configuration
+      - wazuh-manager-logs:/var/ossec/logs
+      - wazuh-manager-queue:/var/ossec/queue
+      - wazuh-manager-rules:/var/ossec/etc/rules
+      - wazuh-manager-decoders:/var/ossec/etc/decoders
+      - wazuh-manager-active-response:/var/ossec/active-response/bin
+      # Custom rules and decoders
+      - ./configs/wazuh/rules/local_rules.xml:/var/ossec/etc/rules/local_rules.xml:ro
+      - ./configs/wazuh/decoders/local_decoder.xml:/var/ossec/etc/decoders/local_decoder.xml:ro
+      - ./configs/wazuh/ossec-manager.conf:/var/ossec/etc/ossec.conf
+      # Active response scripts
+      - ./scripts/active-response/block-ip-firewall.sh:/var/ossec/active-response/bin/block-ip-firewall.sh
+      # SSL certificates
+      - ./configs/ssl/root-ca.pem:/etc/ssl/root-ca.pem:ro
+      - ./configs/ssl/filebeat.pem:/etc/ssl/filebeat.pem:ro
+      - ./configs/ssl/filebeat-key.pem:/etc/ssl/filebeat-key.pem:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -q 'is running'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  # ===========================================================================
+  # WAZUH DASHBOARD (Web UI)
+  # ===========================================================================
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.9.2
+    container_name: wazuh-dashboard
+    hostname: ${WAZUH_DASHBOARD_HOSTNAME}
+    restart: unless-stopped
+    depends_on:
+      wazuh-manager:
+        condition: service_healthy
+      wazuh-indexer:
+        condition: service_healthy
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${WAZUH_DASHBOARD_IP}
+    environment:
+      - INDEXER_USERNAME=${INDEXER_USERNAME}
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD}
+      - WAZUH_API_URL=https://${WAZUH_MANAGER_IP}
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=kibanaserver
+      - API_USERNAME=${WAZUH_API_USER}
+      - API_PASSWORD=${WAZUH_API_PASSWORD}
+    volumes:
+      - ./configs/ssl/dashboard.pem:/usr/share/wazuh-dashboard/certs/dashboard.pem:ro
+      - ./configs/ssl/dashboard-key.pem:/usr/share/wazuh-dashboard/certs/dashboard-key.pem:ro
+      - ./configs/ssl/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:5601/api/status | grep -q 'available'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ===========================================================================
+  # JOKOPI COFFEE SHOP APPLICATION (Target)
+  # ===========================================================================
+  jokopi-app:
+    build:
+      context: ./docker/jokopi
+      dockerfile: Dockerfile
+      args:
+        - WAZUH_MANAGER_IP=${WAZUH_MANAGER_IP}
+        - WAZUH_REGISTRATION_PASSWORD=${WAZUH_REGISTRATION_PASSWORD}
+    container_name: jokopi-coffeeshop
+    hostname: jokopi
+    restart: unless-stopped
+    depends_on:
+      wazuh-manager:
+        condition: service_healthy
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${JOKOPI_APP_IP}
+    volumes:
+      - jokopi-logs:/var/log/nginx
+      - jokopi-app-data:/var/www/html
+    environment:
+      - APP_ENV=development
+      - ADMIN_USER=${JOKOPI_ADMIN_USER}
+      - ADMIN_PASS=${JOKOPI_ADMIN_PASS}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # KALI LINUX ATTACKER
+  # ===========================================================================
+  kali-attacker:
+    build:
+      context: ./docker/kali
+      dockerfile: Dockerfile
+    container_name: kali-attacker
+    hostname: kali
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      coffeeshop-net:
+        ipv4_address: ${KALI_IP}
+    volumes:
+      - ./scripts/attacks:/opt/attacks
+      - kali-data:/root/results
+    environment:
+      - TARGET_IP=${JOKOPI_APP_IP}
+      - FIREWALL_IP=${FIREWALL_IP}
+      - WAZUH_IP=${WAZUH_MANAGER_IP}
+      - NETWORK_RANGE=${NETWORK_SUBNET}
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  coffeeshop-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: ${NETWORK_SUBNET}
+          gateway: ${NETWORK_GATEWAY}
+    driver_opts:
+      com.docker.network.bridge.name: coffeeshop-br0
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  # Wazuh volumes
+  wazuh-indexer-data:
+  wazuh-manager-config:
+  wazuh-manager-api:
+  wazuh-manager-logs:
+  wazuh-manager-queue:
+  wazuh-manager-rules:
+  wazuh-manager-decoders:
+  wazuh-manager-active-response:
+  # Firewall volumes
+  firewall-logs:
+  # Application volumes
+  jokopi-logs:
+  jokopi-app-data:
+  # Kali volumes
+  kali-data:

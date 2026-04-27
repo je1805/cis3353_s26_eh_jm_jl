@@ -1,0 +1,23 @@
+# =============================================================================
+# Wazuh Indexer (OpenSearch) - CIS 3353 Lab Configuration
+# =============================================================================
+# Classroom lab single-node config with security plugin disabled. Do NOT
+# deploy this outside a fully isolated lab network — there is no auth and
+# all traffic is plaintext. Suitable only for the Build/Attack/Defend demo
+# where every container is on the coffeeshop-net bridge on a single host.
+# =============================================================================
+
+network.host: 0.0.0.0
+node.name: node-1
+cluster.name: wazuh-cluster
+discovery.type: single-node
+
+path.data: /var/lib/wazuh-indexer
+path.logs: /var/log/wazuh-indexer
+
+# Disable the entire security plugin. This removes the SSL cert path checks
+# that SecurityManager was failing, and removes auth on port 9200.
+plugins.security.disabled: true
+
+# Required for Filebeat 7.x (used by Wazuh Manager) to talk to OpenSearch 2.x
+compatibility.override_main_response_version: true

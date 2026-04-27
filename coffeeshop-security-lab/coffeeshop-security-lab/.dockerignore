@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.md
+docs/
+evidence/
+reports/
+.env.example
