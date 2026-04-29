@@ -51,7 +51,11 @@ services:
     ports:
       - "8443:8443"     # Firewall Web Management UI
       - "8080:80"       # Forward to Jokopi app (external access)
-      - "5601:5601"     # Forward to Wazuh Dashboard (management)
+      # NOTE: 5601 is NOT bound here. Host-port publish on the firewall
+      # doesn't forward traffic — that requires iptables DNAT inside the
+      # firewall container. The Wazuh dashboard binds :5601 directly on
+      # the host (see wazuh-dashboard service below). Binding 5601 here
+      # too would conflict and prevent the dashboard from starting.
     volumes:
       - firewall-logs:/var/log/firewall
       - ./configs/firewall:/etc/firewall/rules.d
@@ -95,21 +99,42 @@ services:
         hard: 65536
     volumes:
       - wazuh-indexer-data:/var/lib/wazuh-indexer
+      # Classroom-lab override: disable the security plugin entirely via a
+      # custom opensearch.yml. The image's baked-in config uses absolute cert
+      # paths that SecurityManager refuses to read (path.conf is actually
+      # /usr/share/wazuh-indexer, not /etc/wazuh-indexer). Disabling security
+      # sidesteps the cert-loading code path completely. NOT for production.
+      - ./configs/wazuh/opensearch-indexer.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      # Cert mounts kept at the install-prefix location (unused while security
+      # is disabled, but left in place so re-enabling auth later is a one-line
+      # change in opensearch.yml).
       - ./configs/ssl/indexer.pem:/usr/share/wazuh-indexer/certs/indexer.pem:ro
       - ./configs/ssl/indexer-key.pem:/usr/share/wazuh-indexer/certs/indexer-key.pem:ro
       - ./configs/ssl/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200 | grep -q 'wazuh-indexer'"]
-      interval: 30s
+      # The old check grep'd for 'wazuh-indexer' in the `/` response, but with
+      # compatibility.override_main_response_version=true (required for
+      # Filebeat 7.x) that string is no longer in the payload. Check cluster
+      # health instead — green|yellow is the universal "ready to accept
+      # indexing" signal and doesn't depend on response formatting.
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9200/_cluster/health' | grep -Eq '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
       timeout: 10s
-      retries: 5
+      retries: 10
       start_period: 60s
 
   # ===========================================================================
   # WAZUH MANAGER (SIEM Engine)
   # ===========================================================================
   wazuh-manager:
-    image: wazuh/wazuh-manager:4.9.2
+    # Custom build FROM wazuh/wazuh-manager:4.9.2 that bakes our ossec.conf,
+    # rules, decoders, and AR script into the image. See the Dockerfile for
+    # why bind mounts into /var/ossec/ don't work with this image's
+    # entrypoint seeding logic.
+    build:
+      context: .
+      dockerfile: docker/wazuh-manager/Dockerfile
+    image: coffeeshop-lab/wazuh-manager:4.9.2
     container_name: wazuh-manager
     hostname: ${WAZUH_MANAGER_HOSTNAME}
     restart: unless-stopped
@@ -124,57 +149,94 @@ services:
       - "1515:1515"     # Agent registration
       - "55000:55000"   # Wazuh API
     environment:
-      - INDEXER_URL=https://${WAZUH_INDEXER_IP}:9200
+      # Indexer is running with plugins.security.disabled=true for the lab,
+      # so Filebeat must speak plain HTTP and skip auth. (Production: flip
+      # plugins.security.disabled back off in opensearch-indexer.yml and
+      # restore https:// + creds here.)
+      - INDEXER_URL=http://${WAZUH_INDEXER_IP}:9200
       - INDEXER_USERNAME=${INDEXER_USERNAME}
       - INDEXER_PASSWORD=${INDEXER_PASSWORD}
       - FILEBEAT_SSL_VERIFICATION_MODE=none
-      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
-      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
-      - SSL_KEY=/etc/ssl/filebeat-key.pem
       - API_USERNAME=${WAZUH_API_USER}
       - API_PASSWORD=${WAZUH_API_PASSWORD}
     volumes:
-      - wazuh-manager-config:/var/ossec/etc
+      # Persist only dirs that hold runtime state AND aren't under
+      # /var/ossec/etc or /var/ossec/active-response/bin. Any bind mount under
+      # /var/ossec/ — whether a named volume over a directory, or a single
+      # file — makes the entrypoint's permanent-data seeder skip the parent,
+      # which is how we ended up with missing shared/ar.conf. Our custom
+      # config files are now baked into the image (see Dockerfile), so no
+      # bind mounts are needed for them.
       - wazuh-manager-api:/var/ossec/api/configuration
       - wazuh-manager-logs:/var/ossec/logs
       - wazuh-manager-queue:/var/ossec/queue
-      - wazuh-manager-rules:/var/ossec/etc/rules
-      - wazuh-manager-decoders:/var/ossec/etc/decoders
-      - wazuh-manager-active-response:/var/ossec/active-response/bin
-      # Custom rules and decoders
-      - ./configs/wazuh/rules/local_rules.xml:/var/ossec/etc/rules/local_rules.xml:ro
-      - ./configs/wazuh/decoders/local_decoder.xml:/var/ossec/etc/decoders/local_decoder.xml:ro
-      - ./configs/wazuh/ossec-manager.conf:/var/ossec/etc/ossec.conf
-      # Active response scripts
-      - ./scripts/active-response/block-ip-firewall.sh:/var/ossec/active-response/bin/block-ip-firewall.sh
-      # SSL certificates
+      # SSL certificates for Filebeat → Indexer. These live outside
+      # /var/ossec/, so they're safe as bind mounts. (Unused at the moment
+      # since the upstream indexer runs plaintext; kept for easy toggle.)
       - ./configs/ssl/root-ca.pem:/etc/ssl/root-ca.pem:ro
       - ./configs/ssl/filebeat.pem:/etc/ssl/filebeat.pem:ro
       - ./configs/ssl/filebeat-key.pem:/etc/ssl/filebeat-key.pem:ro
+      # Docker socket: lets the AR script in this container run
+      # `docker exec pfsense-firewall /opt/active-response/handler.sh …`
+      # to push iptables rules into the firewall container. This is the
+      # quickest cross-container control plane for the lab; in production
+      # you'd replace this with an HTTP API or wazuh-agent on the firewall.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -q 'is running'"]
-      interval: 30s
+      # Consider the manager healthy as soon as wazuh-analysisd (the core
+      # engine that consumes agent events and produces alerts) is running.
+      # `wazuh-control status` returns lines like "wazuh-analysisd is running"
+      # for each daemon; filtering by daemon name avoids the previous
+      # ambiguity where "not running" lines coexisted with "is running" ones.
+      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -E 'wazuh-analysisd.*is running' -q"]
+      interval: 20s
       timeout: 10s
-      retries: 5
-      start_period: 90s
+      retries: 8
+      start_period: 120s
 
   # ===========================================================================
   # WAZUH DASHBOARD (Web UI)
   # ===========================================================================
   wazuh-dashboard:
-    image: wazuh/wazuh-dashboard:4.9.2
+    # Custom build FROM wazuh/wazuh-dashboard:4.9.2 that removes the
+    # `securityDashboards` plugin. The indexer runs with
+    # plugins.security.disabled=true, so the plugin's login probe to
+    # /_plugins/_security/authinfo always 401s — and the plugin's strict
+    # config schema rejects the usual `opensearch_security.disabled: true`
+    # workaround. Removing it at build time is the only path that works
+    # cleanly. See docker/wazuh-dashboard/Dockerfile for the full story.
+    build:
+      context: .
+      dockerfile: docker/wazuh-dashboard/Dockerfile
+    image: coffeeshop-lab/wazuh-dashboard:4.9.2
     container_name: wazuh-dashboard
     hostname: ${WAZUH_DASHBOARD_HOSTNAME}
     restart: unless-stopped
     depends_on:
+      # Dashboard only strictly needs the indexer (OpenSearch) to be up on
+      # boot — it queries the manager's API lazily once a user logs in.
+      # Using service_healthy here would deadlock first-boot if the manager
+      # is slow to start, so we only require it to be *started*.
       wazuh-manager:
-        condition: service_healthy
+        condition: service_started
       wazuh-indexer:
         condition: service_healthy
     networks:
       coffeeshop-net:
         ipv4_address: ${WAZUH_DASHBOARD_IP}
+    ports:
+      # Publish the dashboard's HTTPS listener to the host so the instructor
+      # / student can reach the UI at https://localhost:5601 in a browser.
+      # Without this block the dashboard is only reachable on the internal
+      # coffeeshop-net (e.g. from the Kali container at 10.10.0.11:5601).
+      - "5601:5601"
     environment:
+      # Indexer security plugin is disabled for the lab, so the dashboard
+      # talks HTTP and the creds are ignored. Wazuh API (manager) still
+      # uses HTTPS with a self-signed cert — that one is driven by the
+      # manager itself and kept as-is.
+      - OPENSEARCH_HOSTS=http://${WAZUH_INDEXER_IP}:9200
+      - INDEXER_URL=http://${WAZUH_INDEXER_IP}:9200
       - INDEXER_USERNAME=${INDEXER_USERNAME}
       - INDEXER_PASSWORD=${INDEXER_PASSWORD}
       - WAZUH_API_URL=https://${WAZUH_MANAGER_IP}
@@ -183,14 +245,33 @@ services:
       - API_USERNAME=${WAZUH_API_USER}
       - API_PASSWORD=${WAZUH_API_PASSWORD}
     volumes:
-      - ./configs/ssl/dashboard.pem:/usr/share/wazuh-dashboard/certs/dashboard.pem:ro
-      - ./configs/ssl/dashboard-key.pem:/usr/share/wazuh-dashboard/certs/dashboard-key.pem:ro
-      - ./configs/ssl/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
+      # Dashboard certs MUST live at /etc/wazuh-dashboard/certs/ — unlike the
+      # indexer (where we disabled the security plugin and the paths are
+      # moot), the dashboard's baked-in opensearch_dashboards.yml references
+      # these absolute paths for server.ssl.* (the HTTPS listener on :5601).
+      # Moving them to /usr/share/... would make Node.js throw ENOENT before
+      # the dashboard can even start.
+      - ./configs/ssl/dashboard.pem:/etc/wazuh-dashboard/certs/dashboard.pem:ro
+      - ./configs/ssl/dashboard-key.pem:/etc/wazuh-dashboard/certs/dashboard-key.pem:ro
+      - ./configs/ssl/root-ca.pem:/etc/wazuh-dashboard/certs/root-ca.pem:ro
+      # Our custom image already bakes this file in at build time, but
+      # bind-mounting it here lets us iterate on the YAML without a full
+      # rebuild: edit the file, `docker compose restart wazuh-dashboard`,
+      # done. If you remove this line the image's baked copy takes over.
+      # Env vars like OPENSEARCH_HOSTS are ignored by this image — it
+      # reads the YAML directly.
+      - ./configs/wazuh/opensearch-dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -sk https://localhost:5601/api/status | grep -q 'available'"]
-      interval: 30s
+      # /api/status requires auth once securityDashboards is loaded, so the
+      # old grep-for-'available' probe can never succeed. Instead, just check
+      # that the listener is alive — any HTTP response (200/302/401) means
+      # Node is up and the port is bound. "alive" is good enough for the
+      # depends_on gate; real readiness is confirmed by hitting the login
+      # page in a browser.
+      test: ["CMD-SHELL", "curl -ksI https://localhost:5601 -o /dev/null -w '%{http_code}\\n' | grep -qE '^(200|302|401)$'"]
+      interval: 20s
       timeout: 10s
-      retries: 5
+      retries: 10
       start_period: 120s
 
   # ===========================================================================
@@ -271,15 +352,13 @@ networks:
 # VOLUMES
 # =============================================================================
 volumes:
-  # Wazuh volumes
+  # Wazuh volumes — only runtime-state dirs are persisted. Other paths
+  # (/var/ossec/etc, rules, decoders, active-response/bin) must come from the
+  # image so shipped files like shared/ar.conf are present.
   wazuh-indexer-data:
-  wazuh-manager-config:
   wazuh-manager-api:
   wazuh-manager-logs:
   wazuh-manager-queue:
-  wazuh-manager-rules:
-  wazuh-manager-decoders:
-  wazuh-manager-active-response:
   # Firewall volumes
   firewall-logs:
   # Application volumes

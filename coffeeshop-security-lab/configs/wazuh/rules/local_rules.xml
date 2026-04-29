@@ -65,7 +65,10 @@
 
   <rule id="100110" level="10">
     <if_group>web|accesslog|nginx</if_group>
-    <regex>\x3cscript|%3Cscript|javascript:|onerror=|onload=|onclick=|onfocus=</regex>
+    <!-- OS_Regex does not support \x hex escapes; %3Cscript (URL-encoded) is
+         what we'd actually see in nginx access logs. For raw < in payloads
+         switch this rule to <pcre2> instead of <regex>. -->
+    <regex>%3Cscript|javascript:|onerror=|onload=|onclick=|onfocus=</regex>
     <description>XSS attempt detected in web request to Jokopi app</description>
     <mitre>
       <id>T1189</id>
@@ -128,9 +131,36 @@
        DIRECTORY TRAVERSAL DETECTION
        ===================================================================== -->
 
+  <!-- Directory traversal — scoped to ACCESS logs only.
+       Earlier this rule was <if_group>web|accesslog|nginx</if_group> +
+       an OS_Regex alternation. That combination was firing on every
+       nginx debug-trace line in error.log and produced ~99k false
+       positives in under 2 minutes (see DEPLOYMENT_GUIDE §5.6).
+
+       History of attempted fixes:
+         - First attempt used <pcre2> with explicit traversal markers.
+           Wazuh 4.9.2 rejects <pcre2> as a tag inside <rule> with
+           "ERROR: Invalid option 'pcre2' for rule '100130'" — the
+           tag is decoder-only on this version.
+         - Second (current) attempt uses <match> with pipe-separated
+           literal substrings. <match> uses OS_Match for fixed-content
+           searching and has no regex semantics to misparse — it just
+           checks whether any of the listed substrings appear in the
+           log line. Combined with the <if_sid> scope below, this is
+           the simplest tool that works on every 4.x version.
+
+       Why this is safe:
+         1. <if_sid>31100</if_sid> — only fire as a child of the stock
+            "Group of web access rules" base rule (sid 31100). Nginx
+            error.log lines decode under a different parent and never
+            reach this rule.
+         2. <match> on literal traversal markers — `../` (raw),
+            `%2e%2e` (URL-encoded), `%252e%252e` (double-encoded),
+            and the canonical sensitive-path strings. None of these
+            ever appear in a benign URL or User-Agent. -->
   <rule id="100130" level="10">
-    <if_group>web|accesslog|nginx</if_group>
-    <regex>\.\.\/|\.\.\\|%2e%2e|%252e%252e|/etc/passwd|/etc/shadow</regex>
+    <if_sid>31100</if_sid>
+    <match>../|%2e%2e|%252e%252e|/etc/passwd|/etc/shadow|/proc/self</match>
     <description>Directory traversal attempt detected against Jokopi app</description>
     <mitre>
       <id>T1083</id>

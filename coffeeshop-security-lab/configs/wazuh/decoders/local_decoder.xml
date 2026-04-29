@@ -31,9 +31,16 @@
 </decoder>
 
 <!-- Firewall iptables Log Decoder -->
+<!--
+  NOTE: In OSSEC/Wazuh's OS_Regex engine, `[` and `]` are LITERAL characters
+  and must NOT be backslash-escaped. `\[` produces "(1452): Syntax error on
+  regex" because OS_Regex does not recognize `\[` as an escape sequence
+  (unlike PCRE / Python). If you want the familiar escape syntax, use the
+  <pcre2> tag instead of <regex>.
+-->
 <decoder name="coffeeshop-firewall">
-  <prematch>\[FW-</prematch>
-  <regex>\[(FW-\S+)\] IN=(\S*) OUT=(\S*) SRC=(\S+) DST=(\S+) .*PROTO=(\S+)</regex>
+  <prematch>[FW-</prematch>
+  <regex>[(FW-\S+)] IN=(\S*) OUT=(\S*) SRC=(\S+) DST=(\S+) .*PROTO=(\S+)</regex>
   <order>action,in_iface,out_iface,srcip,dstip,protocol</order>
 </decoder>
 
