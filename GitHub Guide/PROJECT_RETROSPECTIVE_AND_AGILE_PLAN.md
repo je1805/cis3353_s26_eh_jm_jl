@@ -1,7 +1,7 @@
 # CIS 3353 — Coffee Shop Security Lab
 ## Project Retrospective & Agile Implementation Plan
 
-**Repository:** `cis3353_s26_<TEAM_INITIALS>` (per Section 4, Step 1 naming convention)
+**Repository:** `cis3353_s26_eh_jm_jl` (per Section 4, Step 1 naming convention)
 **Course:** CIS 3353 Computer Systems Security — Spring 2026
 **Reference Framework:** *CIS 3353 Group Project Kick-off Guide v3.0* (8th Edition module structure)
 
