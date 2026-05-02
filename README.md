@@ -37,6 +37,8 @@ This project builds that entire scenario in Docker containers on your computer. 
 
 The key moment is when Wazuh detects an attack and tells the firewall to block the attacker's IP address without any human intervention. That is the automated incident response pipeline this project demonstrates.
 
+Link to our wiki: https://github.com/je1805/cis3353_s26_eh_jm_jl/wiki
+
 ---
 
 ## Key Concepts for Beginners
